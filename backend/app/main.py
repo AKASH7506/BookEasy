@@ -1,3 +1,4 @@
+from .models import User
 from dotenv import load_dotenv
 from pathlib import Path
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -5,20 +6,38 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
 from sqlalchemy import func, text, inspect
 from datetime import datetime, date
 import os, secrets
 
-from .database import Base, engine, get_db
-from .models import User, Product, Service, Booking, MaintenancePlan, TechnicianApplication, Feedback
+
 from .schemas import RegisterIn, LoginIn, BookingIn, MaintenanceIn, ProfileIn, TechnicianApplicationIn, FeedbackIn
 from .auth import hash_password, verify_password, create_token, current_user, admin_user
 from .firestore_db import get_all_documents, get_document, set_document
-Base.metadata.create_all(bind=engine)
-app = FastAPI(title="BookEasy API", version="3.0.0", description="Product service booking and field-service operations platform")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-FRONT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../frontend"))
+
+
+app = FastAPI(
+    title="BookEasy API",
+    version="3.0.0",
+    description="Product service booking and field-service operations platform"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+FRONT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../frontend")
+)
+
+@app.on_event("startup")
+def startup():
+    print("BookEasy backend started.")
+
 
 PRODUCT_DATA = {
     "Air Conditioner": ("ac", "Cooling, repair, cleaning, installation and gas-related service", [
@@ -133,66 +152,141 @@ PRODUCT_DATA = {
 }
 
 
-def seed(db: Session):
-    for name, (icon, desc, services) in PRODUCT_DATA.items():
-        p = db.query(Product).filter(Product.name == name).first()
-        if not p:
-            p = Product(name=name, icon=icon, description=desc)
-            db.add(p); db.flush()
-        else:
-            p.icon, p.description, p.active = icon, desc, True
-        existing = {s.name: s for s in p.services}
-        for idx, (sn, sd, help_text) in enumerate(services):
-            s = existing.get(sn)
-            if not s:
-                s = Service(product_id=p.id, name=sn, description=f"{sd} {help_text}", price=0, duration="1–3 hours")
-                db.add(s)
-            else:
-                s.description = f"{sd} {help_text}"; s.active = True
-    # One real administrator is provisioned for initial system ownership.
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@bookeasy.com").lower()
-    admin_name = os.getenv("ADMIN_NAME", "BookEasy Administrator")
-    admin_password = os.getenv("ADMIN_PASSWORD", "ChangeThisAdminPassword")
-    admin = db.query(User).filter(User.email == admin_email).first()
-    if not admin:
-        db.add(User(name=admin_name, email=admin_email, password_hash=hash_password(admin_password), role="admin", phone="", address="BookEasy Service Center"))
-    # A starter approved technician keeps local development/testing possible; no demo credentials are displayed in the UI.
-    tech = db.query(User).filter(User.email == "tech@bookeasy.com").first()
-    if not tech:
-        db.add(User(name="Rajesh Kumar", email="tech@bookeasy.com", password_hash=hash_password("Tech@123"), role="technician", phone="9876543211", address="Durgapur Service Zone"))
-    db.commit()
+
+
 
 @app.on_event("startup")
 def startup():
-    Base.metadata.create_all(bind=engine)
-    db = next(get_db())
-    try: seed(db)
-    finally: db.close()
+    print("BookEasy backend started.")
+
 
 @app.get("/api/health")
 def health(): return {"status":"ok","service":"BookEasy API","version":"3.0.0"}
 
+
+from types import SimpleNamespace
+
 @app.post("/api/auth/register")
-def register(data:RegisterIn, db:Session=Depends(get_db)):
-    email=data.email.lower()
-    if db.query(User).filter(User.email==email).first(): raise HTTPException(400,"Email already registered")
-    u=User(name=data.name,email=email,phone=data.phone,address=data.address,password_hash=hash_password(data.password),role="customer")
-    db.add(u); db.commit(); db.refresh(u)
-    return {"access_token":create_token(u),"user":{"id":u.id,"name":u.name,"email":u.email,"role":u.role}}
+def register(data: RegisterIn):
+    email = str(data.email).lower().strip()
+    users = get_all_documents("users")
+
+    # Prevent duplicate accounts
+    if any(
+        user.get("email", "").lower() == email
+        for user in users
+    ):
+        raise HTTPException(400, "Email already registered")
+
+    # Generate a unique numeric user ID
+    next_id = max(
+        (int(user.get("id", 0)) for user in users),
+        default=0
+    ) + 1
+
+    user_data = {
+        "id": next_id,
+        "name": data.name,
+        "email": email,
+        "phone": data.phone,
+        "address": data.address,
+        "password_hash": hash_password(data.password),
+        "role": "customer",
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    # Save using the numeric ID as the Firestore document ID
+    set_document("users", next_id, user_data)
+
+    token_user = SimpleNamespace(id=next_id)
+
+    return {
+        "access_token": create_token(token_user),
+        "user": {
+            "id": next_id,
+            "name": data.name,
+            "email": email,
+            "role": "customer"
+        }
+    }
+
 
 @app.post("/api/auth/login")
-def login(data:LoginIn, db:Session=Depends(get_db)):
-    u=db.query(User).filter(User.email==data.email.lower()).first()
-    if not u or not verify_password(data.password,u.password_hash): raise HTTPException(401,"Invalid email or password")
-    if data.expected_role and u.role != data.expected_role: raise HTTPException(403,f"This account is not a {data.expected_role} account")
-    return {"access_token":create_token(u),"user":{"id":u.id,"name":u.name,"email":u.email,"role":u.role}}
+def login(data: LoginIn):
+    email = str(data.email).lower().strip()
+    users = get_all_documents("users")
+
+    user = next(
+        (
+            item for item in users
+            if item.get("email", "").lower() == email
+        ),
+        None
+    )
+
+    if not user or not verify_password(
+        data.password,
+        user.get("password_hash", "")
+    ):
+        raise HTTPException(401, "Invalid email or password")
+
+    if data.expected_role and user.get("role") != data.expected_role:
+        raise HTTPException(
+            403,
+            f"This account is not a {data.expected_role} account"
+        )
+
+    user_id = user.get("id")
+
+    if user_id is None:
+        raise HTTPException(500, "User record has no ID")
+
+    token_user = SimpleNamespace(id=user_id)
+
+    return {
+        "access_token": create_token(token_user),
+        "user": {
+            "id": user_id,
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "role": user.get("role", "customer")
+        }
+    }
+
 
 @app.get("/api/me")
 def me(u:User=Depends(current_user)): return {"id":u.id,"name":u.name,"email":u.email,"phone":u.phone,"address":u.address,"role":u.role}
 
+
+
 @app.put("/api/me")
-def update_me(data:ProfileIn,u:User=Depends(current_user),db:Session=Depends(get_db)):
-    u.name=data.name;u.phone=data.phone;u.address=data.address;db.commit();return {"message":"Profile updated"}
+def update_me(
+    data: ProfileIn,
+    u: User = Depends(current_user)
+):
+    users = get_all_documents("users")
+
+    user_data = next(
+        (
+            user for user in users
+            if str(user.get("id")) == str(u.id)
+        ),
+        None
+    )
+
+    if not user_data:
+        raise HTTPException(404, "User not found")
+
+    user_data["name"] = data.name
+    user_data["phone"] = data.phone
+    user_data["address"] = data.address
+
+    set_document("users", u.id, user_data)
+
+    return {"message": "Profile updated successfully"}
+
+
+
 
 @app.get("/api/products")
 def products():
@@ -214,18 +308,18 @@ def products():
     for p in active_products:
         product_services = [
             {
-                "id": s["id"],
-                "name": s["name"],
+                "id": s.get("id"),
+                "name": s.get("name", "Service"),
                 "description": s.get("description", ""),
                 "duration": s.get("duration", "1–2 hours")
             }
             for s in active_services
-            if s.get("product_id") == p["id"]
+            if str(s.get("product_id")) == str(p.get("id"))
         ]
 
         result.append({
-            "id": p["id"],
-            "name": p["name"],
+            "id": p.get("id"),
+            "name": p.get("name", "Product"),
             "icon": p.get("icon", "service"),
             "description": p.get("description", ""),
             "services": product_services
@@ -234,13 +328,16 @@ def products():
     result.sort(key=lambda x: x["name"].lower())
 
     return result
+
+
+
 @app.get("/api/services")
 def services():
     products_data = get_all_documents("products")
     services_data = get_all_documents("services")
 
     product_map = {
-        p["id"]: p["name"]
+        str(p.get("id")): p.get("name", "Unknown Product")
         for p in products_data
     }
 
@@ -250,29 +347,29 @@ def services():
         if not s.get("active", True):
             continue
 
+        product_id = s.get("product_id")
+
         result.append({
-            "id": s["id"],
-            "product_id": s["product_id"],
+            "id": s.get("id"),
+            "product_id": product_id,
             "product": product_map.get(
-                s["product_id"],
+                str(product_id),
                 "Unknown Product"
             ),
-            "name": s["name"],
+            "name": s.get("name", "Service"),
             "description": s.get("description", ""),
-            "duration": s.get(
-                "duration",
-                "1–2 hours"
-            )
+            "duration": s.get("duration", "1–2 hours")
         })
 
     result.sort(
         key=lambda x: (
-            x["product_id"],
-            x["id"]
+            str(x["product_id"]),
+            int(x["id"] or 0)
         )
     )
 
     return result
+
 @app.post("/api/bookings")
 def create_booking(
     data: BookingIn,
@@ -371,115 +468,955 @@ def booking_out(b):
     return {"id":b.id,"booking_code":b.booking_code,"service":b.service.name,"product":b.service.product.name,"date":b.service_date,"time":b.service_time,"address":b.address,"phone":b.phone,"brand":b.product_brand,"model":b.product_model,"notes":b.notes,"status":b.status,"payment_status":b.payment_status,"technician":({"id":b.technician.id,"name":b.technician.name,"phone":b.technician.phone} if b.technician else None),"feedback":feedback_out(b.feedback) if b.feedback else None,"created_at":b.created_at.isoformat() if b.created_at else None}
 
 @app.get("/api/bookings")
-def my_bookings(u:User=Depends(current_user),db:Session=Depends(get_db)):
-    return [booking_out(b) for b in db.query(Booking).filter(Booking.customer_id==u.id).order_by(Booking.id.desc()).all()]
+def my_bookings(u: User = Depends(current_user)):
+
+    bookings = get_all_documents("bookings")
+    services_data = get_all_documents("services")
+    products_data = get_all_documents("products")
+    users_data = get_all_documents("users")
+    feedback_data = get_all_documents("feedback")
+
+    service_map = {
+        str(s["id"]): s
+        for s in services_data
+    }
+
+    product_map = {
+        str(p["id"]): p
+        for p in products_data
+    }
+
+    user_map = {
+        str(user["id"]): user
+        for user in users_data
+    }
+
+    result = []
+
+    for b in bookings:
+
+        if str(b.get("customer_id")) != str(u.id):
+            continue
+
+        service = service_map.get(str(b.get("service_id")), {})
+        product = product_map.get(str(service.get("product_id")), {})
+
+        technician = None
+
+        if b.get("technician_id"):
+            tech = user_map.get(str(b["technician_id"]))
+            if tech:
+                technician = {
+                    "id": tech.get("id"),
+                    "name": tech.get("name"),
+                    "phone": tech.get("phone")
+                }
+
+        feedback = None
+
+        for f in feedback_data:
+            if str(f.get("booking_id")) == str(b.get("id")):
+                feedback = {
+                    "id": f.get("id"),
+                    "booking_id": f.get("booking_id"),
+                    "rating": f.get("rating"),
+                    "comment": f.get("comment"),
+                    "created_at": f.get("created_at")
+                }
+                break
+
+        result.append({
+            "id": b.get("id"),
+            "booking_code": b.get("booking_code"),
+            "service": service.get("name", ""),
+            "product": product.get("name", ""),
+            "date": b.get("service_date"),
+            "time": b.get("service_time"),
+            "address": b.get("address"),
+            "phone": b.get("phone"),
+            "brand": b.get("product_brand"),
+            "model": b.get("product_model"),
+            "notes": b.get("notes"),
+            "status": b.get("status", "Pending"),
+            "payment_status": b.get("payment_status"),
+            "technician": technician,
+            "feedback": feedback,
+            "created_at": b.get("created_at")
+        })
+
+    result.sort(
+        key=lambda x: str(x.get("id", "")),
+        reverse=True
+    )
+
+    return result
+
+
 
 @app.get("/api/bookings/{booking_id}")
-def get_booking(booking_id:int,u:User=Depends(current_user),db:Session=Depends(get_db)):
-    b=db.get(Booking,booking_id)
-    if not b or (b.customer_id!=u.id and u.role!="admin" and b.technician_id!=u.id): raise HTTPException(404,"Booking not found")
-    return booking_out(b)
+def get_booking(
+    booking_id: int,
+    u: User = Depends(current_user)
+):
+    bookings = get_all_documents("bookings")
+
+    b = next(
+        (
+            booking for booking in bookings
+            if str(booking.get("id")) == str(booking_id)
+        ),
+        None
+    )
+
+    if not b:
+        raise HTTPException(404, "Booking not found")
+
+    # Check booking access
+    if (
+        str(b.get("customer_id")) != str(u.id)
+        and u.role != "admin"
+        and str(b.get("technician_id")) != str(u.id)
+    ):
+        raise HTTPException(404, "Booking not found")
+
+    services = get_all_documents("services")
+    products = get_all_documents("products")
+    users = get_all_documents("users")
+    feedback_items = get_all_documents("feedback")
+
+    service = next(
+        (s for s in services
+         if str(s.get("id")) == str(b.get("service_id"))),
+        {}
+    )
+
+    product = next(
+        (p for p in products
+         if str(p.get("id")) == str(service.get("product_id"))),
+        {}
+    )
+
+    technician = next(
+        (x for x in users
+         if str(x.get("id")) == str(b.get("technician_id"))),
+        None
+    )
+
+    feedback = next(
+        (f for f in feedback_items
+         if str(f.get("booking_id")) == str(b.get("id"))),
+        None
+    )
+
+    return {
+        "id": b.get("id"),
+        "booking_code": b.get("booking_code"),
+        "service": service.get("name", "Service"),
+        "product": product.get("name", "Product"),
+        "date": b.get("service_date"),
+        "time": b.get("service_time"),
+        "address": b.get("address"),
+        "phone": b.get("phone"),
+        "brand": b.get("product_brand"),
+        "model": b.get("product_model"),
+        "notes": b.get("notes"),
+        "status": b.get("status", "Pending"),
+        "payment_status": b.get("payment_status"),
+        "technician": (
+            {
+                "id": technician.get("id"),
+                "name": technician.get("name"),
+                "phone": technician.get("phone")
+            }
+            if technician else None
+        ),
+        "feedback": (
+            {
+                "id": feedback.get("id"),
+                "booking_id": feedback.get("booking_id"),
+                "rating": feedback.get("rating"),
+                "comment": feedback.get("comment"),
+                "created_at": feedback.get("created_at")
+            }
+            if feedback else None
+        ),
+        "created_at": b.get("created_at")
+    }
+
+
+
 
 @app.post("/api/bookings/{booking_id}/feedback")
-def create_feedback(booking_id:int,data:FeedbackIn,u:User=Depends(current_user),db:Session=Depends(get_db)):
-    b=db.get(Booking,booking_id)
-    if not b or b.customer_id != u.id: raise HTTPException(404,"Booking not found")
-    if b.status != "Completed": raise HTTPException(400,"Feedback is available after service completion")
-    if b.feedback: raise HTTPException(400,"Feedback already submitted for this booking")
-    f=Feedback(booking_id=b.id,customer_id=u.id,rating=data.rating,comment=data.comment.strip())
-    db.add(f);db.commit();db.refresh(f);return feedback_out(f)
+def create_feedback(
+    booking_id: int,
+    data: FeedbackIn,
+    u: User = Depends(current_user)
+):
+    # Find the booking in Firestore
+    bookings = get_all_documents("bookings")
+
+    booking = next(
+        (
+            b for b in bookings
+            if str(b.get("id")) == str(booking_id)
+        ),
+        None
+    )
+
+    if not booking or str(booking.get("customer_id")) != str(u.id):
+        raise HTTPException(404, "Booking not found")
+
+    if booking.get("status") != "Completed":
+        raise HTTPException(
+            400,
+            "Feedback is available after service completion"
+        )
+
+    # Check whether feedback already exists
+    feedback_items = get_all_documents("feedback")
+
+    if any(
+        str(f.get("booking_id")) == str(booking_id)
+        for f in feedback_items
+    ):
+        raise HTTPException(
+            400,
+            "Feedback already submitted for this booking"
+        )
+
+    # Generate a new feedback ID
+    next_id = max(
+        (int(f.get("id", 0)) for f in feedback_items),
+        default=0
+    ) + 1
+
+    feedback_data = {
+        "id": next_id,
+        "booking_id": booking_id,
+        "customer_id": u.id,
+        "rating": data.rating,
+        "comment": data.comment.strip(),
+        "created_at": datetime.utcnow()
+    }
+
+    set_document("feedback", next_id, feedback_data)
+
+    return {
+        "id": next_id,
+        "booking_id": booking_id,
+        "rating": data.rating,
+        "comment": data.comment.strip(),
+        "created_at": feedback_data["created_at"].isoformat()
+    }
+
+
+
 
 @app.post("/api/maintenance")
-def maintenance(data:MaintenanceIn,u:User=Depends(current_user),db:Session=Depends(get_db)):
-    if u.role != "customer": raise HTTPException(403,"Only customers can create maintenance plans")
-    if not db.get(Service,data.service_id): raise HTTPException(404,"Service not found")
-    m=MaintenancePlan(customer_id=u.id,service_id=data.service_id,frequency=data.frequency,next_date=data.next_date);db.add(m);db.commit();return {"message":"Maintenance plan created"}
+def maintenance(
+    data: MaintenanceIn,
+    u: User = Depends(current_user)
+):
+    if u.role != "customer":
+        raise HTTPException(
+            403,
+            "Only customers can create maintenance plans"
+        )
+
+    # Verify service exists in Firestore
+    service = get_document("services", data.service_id)
+
+    if not service or not service.get("active", True):
+        raise HTTPException(404, "Service not found")
+
+    # Get existing maintenance plans
+    plans = get_all_documents("maintenance_plans")
+
+    next_id = max(
+        (int(plan.get("id", 0)) for plan in plans),
+        default=0
+    ) + 1
+
+    plan_data = {
+        "id": next_id,
+        "customer_id": u.id,
+        "service_id": data.service_id,
+        "frequency": data.frequency,
+        "next_date": data.next_date,
+        "active": True,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    # Save plan to Firestore
+    set_document("maintenance_plans", next_id, plan_data)
+
+    return {
+        "id": next_id,
+        "message": "Maintenance plan created successfully"
+    }
+
+
+
 
 @app.get("/api/maintenance")
-def maintenance_list(u:User=Depends(current_user),db:Session=Depends(get_db)):
-    if u.role != "customer": return []
-    rows=db.query(MaintenancePlan).filter(MaintenancePlan.customer_id==u.id,MaintenancePlan.active==True).all()
-    return [{"id":m.id,"service":db.get(Service,m.service_id).name,"frequency":m.frequency,"next_date":m.next_date} for m in rows]
+def maintenance_list(
+    u: User = Depends(current_user)
+):
+    if u.role != "customer":
+        return []
+
+    # Read maintenance plans from Firestore
+    plans = get_all_documents("maintenance_plans")
+    services = get_all_documents("services")
+
+    service_map = {
+        str(service.get("id")): service
+        for service in services
+    }
+
+    result = []
+
+    for plan in plans:
+        if str(plan.get("customer_id")) != str(u.id):
+            continue
+
+        if not plan.get("active", True):
+            continue
+
+        service = service_map.get(
+            str(plan.get("service_id")), {}
+        )
+
+        result.append({
+            "id": plan.get("id"),
+            "service": service.get("name", "Service"),
+            "frequency": plan.get("frequency", ""),
+            "next_date": plan.get("next_date")
+        })
+
+    return result
+
+
+
 
 @app.post("/api/technician-applications")
-def apply_technician(data:TechnicianApplicationIn,db:Session=Depends(get_db)):
-    email=data.email.lower()
-    if db.query(User).filter(User.email==email).first(): raise HTTPException(400,"This email is already registered")
-    existing=db.query(TechnicianApplication).filter(TechnicianApplication.email==email).first()
-    if existing and existing.status=="Pending": raise HTTPException(400,"A technician application is already under review")
-    if existing: db.delete(existing); db.flush()
-    a=TechnicianApplication(name=data.name,email=email,phone=data.phone,address=data.address,experience=data.experience,skills=data.skills,password_hash=hash_password(data.password),status="Pending")
-    db.add(a);db.commit();db.refresh(a)
-    return {"message":"Application submitted. The admin will review your details before technician access is activated.","application_id":a.id}
+def apply_technician(data: TechnicianApplicationIn):
+    email = str(data.email).lower().strip()
+
+    # Check registered users in Firestore
+    users = get_all_documents("users")
+
+    if any(
+        user.get("email", "").lower().strip() == email
+        for user in users
+    ):
+        raise HTTPException(
+            400,
+            "This email is already registered"
+        )
+
+    # Check existing applications
+    applications = get_all_documents(
+        "technician_applications"
+    )
+
+    existing = next(
+        (
+            a for a in applications
+            if a.get("email", "").lower().strip() == email
+        ),
+        None
+    )
+
+    if existing and existing.get("status") == "Pending":
+        raise HTTPException(
+            400,
+            "A technician application is already under review"
+        )
+
+    # Generate or reuse application ID
+    if existing:
+        application_id = int(existing["id"])
+    else:
+        application_id = max(
+            (int(a.get("id", 0)) for a in applications),
+            default=0
+        ) + 1
+
+    application_data = {
+        "id": application_id,
+        "name": data.name,
+        "email": email,
+        "phone": data.phone,
+        "address": data.address,
+        "experience": data.experience,
+        "skills": data.skills,
+        "password_hash": hash_password(data.password),
+        "status": "Pending",
+        "created_at": datetime.utcnow().isoformat(),
+        "reviewed_at": None
+    }
+
+    set_document(
+        "technician_applications",
+        application_id,
+        application_data
+    )
+
+    return {
+        "message": (
+            "Application submitted. The admin will review "
+            "your details before technician access is activated."
+        ),
+        "application_id": application_id
+    }
+
 
 @app.get("/api/technician-applications")
-def technician_applications(_:User=Depends(admin_user),db:Session=Depends(get_db)):
-    rows=db.query(TechnicianApplication).order_by(TechnicianApplication.id.desc()).all()
-    return [{"id":a.id,"name":a.name,"email":a.email,"phone":a.phone,"address":a.address,"experience":a.experience,"skills":a.skills,"status":a.status,"created_at":a.created_at.isoformat() if a.created_at else None} for a in rows]
+def technician_applications(
+    _: User = Depends(admin_user)
+):
+    applications = get_all_documents("technician_applications")
+
+    applications.sort(
+        key=lambda a: int(a.get("id") or 0),
+        reverse=True
+    )
+
+    return [
+        {
+            "id": a.get("id"),
+            "name": a.get("name", ""),
+            "email": a.get("email", ""),
+            "phone": a.get("phone", ""),
+            "address": a.get("address", ""),
+            "experience": a.get("experience", ""),
+            "skills": a.get("skills", ""),
+            "status": a.get("status", "Pending"),
+            "created_at": (
+                a.get("created_at").isoformat()
+                if hasattr(a.get("created_at"), "isoformat")
+                else a.get("created_at")
+            )
+        }
+        for a in applications
+    ]
+
+
+
 
 @app.patch("/api/technician-applications/{application_id}")
-def review_technician_application(application_id:int,status:str,u:User=Depends(admin_user),db:Session=Depends(get_db)):
-    if status not in {"Approved","Rejected"}: raise HTTPException(400,"Invalid application status")
-    a=db.get(TechnicianApplication,application_id)
-    if not a: raise HTTPException(404,"Application not found")
-    if a.status != "Pending": raise HTTPException(400,"Application has already been reviewed")
-    a.status=status;a.reviewed_at=datetime.utcnow()
-    if status=="Approved":
-        if db.query(User).filter(User.email==a.email).first(): raise HTTPException(400,"Applicant email is already registered")
-        db.add(User(name=a.name,email=a.email,phone=a.phone,address=a.address,password_hash=a.password_hash,role="technician"))
-    db.commit();return {"message":f"Technician application {status.lower()}","status":status}
+def review_technician_application(
+    application_id: int,
+    status: str,
+    u: User = Depends(admin_user)
+):
+    if status not in {"Approved", "Rejected"}:
+        raise HTTPException(400, "Invalid application status")
+
+    # Get applications from Firestore
+    applications = get_all_documents("technician_applications")
+
+    application = next(
+        (
+            a for a in applications
+            if str(a.get("id")) == str(application_id)
+        ),
+        None
+    )
+
+    if not application:
+        raise HTTPException(404, "Application not found")
+
+    if application.get("status") != "Pending":
+        raise HTTPException(
+            400,
+            "Application has already been reviewed"
+        )
+
+    if status == "Approved":
+        users = get_all_documents("users")
+        email = application.get("email", "").strip().lower()
+
+        # Check whether the applicant is already registered
+        if any(
+            user.get("email", "").strip().lower() == email
+            for user in users
+        ):
+            raise HTTPException(
+                400,
+                "Applicant email is already registered"
+            )
+
+        # Generate a new user ID
+        next_user_id = max(
+            (int(user.get("id", 0)) for user in users),
+            default=0
+        ) + 1
+
+        technician_data = {
+            "id": next_user_id,
+            "name": application.get("name", ""),
+            "email": email,
+            "phone": application.get("phone", ""),
+            "address": application.get("address", ""),
+            "password_hash": application.get("password_hash", ""),
+            "role": "technician",
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        # Save technician account in Firestore
+        set_document("users", next_user_id, technician_data)
+
+    # Update application status in Firestore
+    application["status"] = status
+    application["reviewed_at"] = datetime.utcnow().isoformat()
+
+    set_document(
+        "technician_applications",
+        application_id,
+        application
+    )
+
+    return {
+        "message": f"Technician application {status.lower()}",
+        "status": status
+    }
+
+
 
 @app.get("/api/admin/stats")
-def stats(_:User=Depends(admin_user),db:Session=Depends(get_db)):
-    return {"customers":db.query(User).filter(User.role=="customer").count(),"technicians":db.query(User).filter(User.role=="technician").count(),"bookings":db.query(Booking).count(),"pending":db.query(Booking).filter(Booking.status=="Pending").count(),"active_jobs":db.query(Booking).filter(Booking.status.in_(["Assigned","In Progress"])).count(),"pending_applications":db.query(TechnicianApplication).filter(TechnicianApplication.status=="Pending").count()}
+def stats(_: User = Depends(admin_user)):
+    users = get_all_documents("users")
+    bookings = get_all_documents("bookings")
+    applications = get_all_documents("technician_applications")
+
+    return {
+        "customers": sum(
+            1 for user in users
+            if user.get("role") == "customer"
+        ),
+        "technicians": sum(
+            1 for user in users
+            if user.get("role") == "technician"
+        ),
+        "bookings": len(bookings),
+        "pending": sum(
+            1 for booking in bookings
+            if booking.get("status") == "Pending"
+        ),
+        "active_jobs": sum(
+            1 for booking in bookings
+            if booking.get("status") in ["Assigned", "In Progress"]
+        ),
+        "pending_applications": sum(
+            1 for application in applications
+            if application.get("status") == "Pending"
+        )
+    }
+
+
 
 @app.get("/api/admin/bookings")
-def admin_bookings(_:User=Depends(admin_user),db:Session=Depends(get_db)):
-    return [{**booking_out(b),"customer":b.customer.name,"customer_email":b.customer.email} for b in db.query(Booking).order_by(Booking.id.desc()).all()]
+def admin_bookings(_: User = Depends(admin_user)):
+    bookings = get_all_documents("bookings")
+    users = get_all_documents("users")
+    services = get_all_documents("services")
+    products = get_all_documents("products")
+
+    user_map = {
+        str(user.get("id")): user
+        for user in users
+    }
+    service_map = {
+        str(service.get("id")): service
+        for service in services
+    }
+    product_map = {
+        str(product.get("id")): product
+        for product in products
+    }
+
+    result = []
+
+    for b in bookings:
+        service = service_map.get(str(b.get("service_id")), {})
+        product = product_map.get(str(service.get("product_id")), {})
+        customer = user_map.get(str(b.get("customer_id")), {})
+
+        technician = user_map.get(str(b.get("technician_id")))
+        technician_data = None
+
+        if technician:
+            technician_data = {
+                "id": technician.get("id"),
+                "name": technician.get("name"),
+                "phone": technician.get("phone")
+            }
+
+        result.append({
+            "id": b.get("id"),
+            "booking_code": b.get("booking_code"),
+            "service": service.get("name", "Service"),
+            "product": product.get("name", "Product"),
+            "date": b.get("service_date"),
+            "time": b.get("service_time"),
+            "address": b.get("address"),
+            "phone": b.get("phone"),
+            "brand": b.get("product_brand"),
+            "model": b.get("product_model"),
+            "notes": b.get("notes"),
+            "status": b.get("status", "Pending"),
+            "payment_status": b.get("payment_status"),
+            "technician": technician_data,
+            "feedback": None,
+            "created_at": b.get("created_at"),
+            "customer": customer.get("name", "Unknown customer"),
+            "customer_email": customer.get("email", "")
+        })
+
+    result.sort(
+        key=lambda item: int(item.get("id") or 0),
+        reverse=True
+    )
+
+    return result
+
 
 @app.get("/api/admin/technicians")
-def admin_technicians(_:User=Depends(admin_user),db:Session=Depends(get_db)):
-    return [{"id":u.id,"name":u.name,"email":u.email,"phone":u.phone,"address":u.address,"active_jobs":db.query(Booking).filter(Booking.technician_id==u.id,Booking.status.in_(["Assigned","In Progress"])).count()} for u in db.query(User).filter(User.role=="technician").order_by(User.name).all()]
+def admin_technicians(_: User = Depends(admin_user)):
+    users = get_all_documents("users")
+    bookings = get_all_documents("bookings")
+
+    technicians = [
+        user for user in users
+        if user.get("role") == "technician"
+    ]
+
+    result = []
+
+    for technician in technicians:
+        active_jobs = sum(
+            1 for booking in bookings
+            if str(booking.get("technician_id"))
+            == str(technician.get("id"))
+            and booking.get("status") in {"Assigned", "In Progress"}
+        )
+
+        result.append({
+            "id": technician.get("id"),
+            "name": technician.get("name", ""),
+            "email": technician.get("email", ""),
+            "phone": technician.get("phone", ""),
+            "address": technician.get("address", ""),
+            "active_jobs": active_jobs
+        })
+
+    result.sort(key=lambda technician: technician["name"].lower())
+    return result
+
+
 
 @app.patch("/api/admin/bookings/{booking_id}")
-def admin_update(booking_id:int,status:str,u:User=Depends(admin_user),db:Session=Depends(get_db)):
-    allowed={"Pending","Confirmed","Assigned","In Progress","Completed","Cancelled"}
-    if status not in allowed: raise HTTPException(400,"Invalid status")
-    b=db.get(Booking,booking_id)
-    if not b: raise HTTPException(404,"Booking not found")
-    b.status=status;db.commit();return booking_out(b)
+def admin_update(
+    booking_id: int,
+    status: str,
+    u: User = Depends(admin_user)
+):
+    allowed = {
+        "Pending",
+        "Confirmed",
+        "Assigned",
+        "In Progress",
+        "Completed",
+        "Cancelled"
+    }
+
+    if status not in allowed:
+        raise HTTPException(400, "Invalid status")
+
+    # Find booking in Firestore
+    bookings = get_all_documents("bookings")
+
+    booking = next(
+        (
+            b for b in bookings
+            if str(b.get("id")) == str(booking_id)
+        ),
+        None
+    )
+
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+
+    # Update booking status
+    booking["status"] = status
+    booking["updated_at"] = datetime.utcnow().isoformat()
+
+    set_document("bookings", booking_id, booking)
+
+    return {
+        "id": booking.get("id"),
+        "booking_code": booking.get("booking_code"),
+        "status": booking.get("status"),
+        "message": "Booking status updated successfully"
+    }
+
+
+
 
 @app.patch("/api/admin/bookings/{booking_id}/assign")
-def assign_booking(booking_id:int,technician_id:int,u:User=Depends(admin_user),db:Session=Depends(get_db)):
-    b=db.get(Booking,booking_id); tech=db.get(User,technician_id)
-    if not b: raise HTTPException(404,"Booking not found")
-    if not tech or tech.role!="technician": raise HTTPException(400,"Invalid technician")
-    b.technician_id=tech.id
-    if b.status in {"Pending","Confirmed"}: b.status="Assigned"
-    db.commit();db.refresh(b);return booking_out(b)
+def assign_booking(
+    booking_id: int,
+    technician_id: int,
+    u: User = Depends(admin_user)
+):
+    # Get the booking from Firestore
+    bookings = get_all_documents("bookings")
+
+    booking = next(
+        (
+            b for b in bookings
+            if str(b.get("id")) == str(booking_id)
+        ),
+        None
+    )
+
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+
+    # Find the technician in Firestore
+    users = get_all_documents("users")
+
+    technician = next(
+        (
+            user for user in users
+            if str(user.get("id")) == str(technician_id)
+        ),
+        None
+    )
+
+    if not technician or technician.get("role") != "technician":
+        raise HTTPException(400, "Invalid technician")
+
+    # Assign the technician
+    booking["technician_id"] = technician.get("id")
+
+    if booking.get("status") in {"Pending", "Confirmed"}:
+        booking["status"] = "Assigned"
+
+    booking["updated_at"] = datetime.utcnow().isoformat()
+
+    set_document("bookings", booking_id, booking)
+
+    return {
+        "id": booking.get("id"),
+        "booking_code": booking.get("booking_code"),
+        "technician": {
+            "id": technician.get("id"),
+            "name": technician.get("name"),
+            "phone": technician.get("phone")
+        },
+        "status": booking.get("status"),
+        "message": "Technician assigned successfully"
+    }
+
+
+
 
 @app.get("/api/admin/users")
-def admin_users(_:User=Depends(admin_user),db:Session=Depends(get_db)):
-    return [{"id":u.id,"name":u.name,"email":u.email,"phone":u.phone,"role":u.role,"address":u.address} for u in db.query(User).order_by(User.id.desc()).all()]
+def admin_users(
+    _: User = Depends(admin_user)
+):
+    users = get_all_documents("users")
+
+    result = [
+        {
+            "id": user.get("id"),
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "phone": user.get("phone", ""),
+            "role": user.get("role", "customer"),
+            "address": user.get("address", "")
+        }
+        for user in users
+    ]
+
+    result.sort(
+        key=lambda user: int(user.get("id") or 0),
+        reverse=True
+    )
+
+    return result
+
+
+
 
 @app.get("/api/technician/stats")
-def technician_stats(u:User=Depends(current_user),db:Session=Depends(get_db)):
-    if u.role!="technician": raise HTTPException(403,"Technician access required")
-    jobs=db.query(Booking).filter(Booking.technician_id==u.id)
-    return {"assigned":jobs.filter(Booking.status=="Assigned").count(),"in_progress":jobs.filter(Booking.status=="In Progress").count(),"completed":jobs.filter(Booking.status=="Completed").count(),"total":jobs.count()}
+def technician_stats(u: User = Depends(current_user)):
+    if u.role != "technician":
+        raise HTTPException(403, "Technician access required")
+
+    jobs = [
+        booking
+        for booking in get_all_documents("bookings")
+        if str(booking.get("technician_id")) == str(u.id)
+    ]
+
+    return {
+        "assigned": sum(
+            1 for booking in jobs
+            if booking.get("status") == "Assigned"
+        ),
+        "in_progress": sum(
+            1 for booking in jobs
+            if booking.get("status") == "In Progress"
+        ),
+        "completed": sum(
+            1 for booking in jobs
+            if booking.get("status") == "Completed"
+        ),
+        "total": len(jobs)
+    }
+
 
 @app.get("/api/technician/bookings")
-def technician_bookings(u:User=Depends(current_user),db:Session=Depends(get_db)):
-    if u.role!="technician": raise HTTPException(403,"Technician access required")
-    return [{**booking_out(b),"customer":b.customer.name,"customer_email":b.customer.email} for b in db.query(Booking).filter(Booking.technician_id==u.id).order_by(Booking.id.desc()).all()]
+def technician_bookings(
+    u: User = Depends(current_user)
+):
+    if u.role != "technician":
+        raise HTTPException(403, "Technician access required")
+
+    bookings = get_all_documents("bookings")
+    users = get_all_documents("users")
+    services = get_all_documents("services")
+    products = get_all_documents("products")
+    feedback_items = get_all_documents("feedback")
+
+    user_map = {
+        str(user.get("id")): user for user in users
+    }
+    service_map = {
+        str(service.get("id")): service for service in services
+    }
+    product_map = {
+        str(product.get("id")): product for product in products
+    }
+
+    result = []
+
+    for b in bookings:
+        if str(b.get("technician_id")) != str(u.id):
+            continue
+
+        service = service_map.get(
+            str(b.get("service_id")), {}
+        )
+        product = product_map.get(
+            str(service.get("product_id")), {}
+        )
+        customer = user_map.get(
+            str(b.get("customer_id")), {}
+        )
+
+        technician_feedback = next(
+            (
+                f for f in feedback_items
+                if str(f.get("booking_id")) == str(b.get("id"))
+            ),
+            None
+        )
+
+        result.append({
+            "id": b.get("id"),
+            "booking_code": b.get("booking_code"),
+            "service": service.get("name", "Service"),
+            "product": product.get("name", "Product"),
+            "date": b.get("service_date"),
+            "time": b.get("service_time"),
+            "address": b.get("address"),
+            "phone": b.get("phone"),
+            "brand": b.get("product_brand"),
+            "model": b.get("product_model"),
+            "notes": b.get("notes"),
+            "status": b.get("status", "Pending"),
+            "payment_status": b.get("payment_status"),
+            "technician": {
+                "id": u.id,
+                "name": getattr(u, "name", ""),
+                "phone": getattr(u, "phone", "")
+            },
+            "feedback": (
+                {
+                    "id": technician_feedback.get("id"),
+                    "booking_id": technician_feedback.get("booking_id"),
+                    "rating": technician_feedback.get("rating"),
+                    "comment": technician_feedback.get("comment"),
+                    "created_at": technician_feedback.get("created_at")
+                }
+                if technician_feedback else None
+            ),
+            "created_at": b.get("created_at"),
+            "customer": customer.get("name", "Unknown customer"),
+            "customer_email": customer.get("email", "")
+        })
+
+    result.sort(
+        key=lambda item: int(item.get("id") or 0),
+        reverse=True
+    )
+
+    return result
+
+
 
 @app.patch("/api/technician/bookings/{booking_id}")
-def technician_update(booking_id:int,status:str,u:User=Depends(current_user),db:Session=Depends(get_db)):
-    if u.role!="technician": raise HTTPException(403,"Technician access required")
-    allowed={"Assigned","In Progress","Completed"}
-    if status not in allowed: raise HTTPException(400,"Technician cannot set that status")
-    b=db.get(Booking,booking_id)
-    if not b or b.technician_id!=u.id: raise HTTPException(404,"Assigned job not found")
-    b.status=status;db.commit();db.refresh(b);return booking_out(b)
+def technician_update(
+    booking_id: int,
+    status: str,
+    u: User = Depends(current_user)
+):
+    if u.role != "technician":
+        raise HTTPException(403, "Technician access required")
 
-app.mount("/",StaticFiles(directory=FRONT,html=True),name="frontend")
+    allowed = {"Assigned", "In Progress", "Completed"}
+
+    if status not in allowed:
+        raise HTTPException(
+            400,
+            "Technician cannot set that status"
+        )
+
+    bookings = get_all_documents("bookings")
+
+    booking = next(
+        (
+            b for b in bookings
+            if str(b.get("id")) == str(booking_id)
+        ),
+        None
+    )
+
+    if (
+        not booking
+        or str(booking.get("technician_id")) != str(u.id)
+    ):
+        raise HTTPException(404, "Assigned job not found")
+
+    booking["status"] = status
+    booking["updated_at"] = datetime.utcnow().isoformat()
+
+    set_document("bookings", booking_id, booking)
+
+    return {
+        "id": booking.get("id"),
+        "booking_code": booking.get("booking_code"),
+        "status": booking.get("status"),
+        "message": "Booking status updated successfully"
+    }
+
+app.mount(
+    "/",
+    StaticFiles(directory=FRONT, html=True),
+    name="frontend"
+)
